@@ -1,86 +1,85 @@
 # ────────────────────────────────────────────────────────────────────────────
-# R Script: 1-yr Daily PX_LAST & VOLUME for IONQ, QBTS, RGTI → Excel in Downloads
+# R Script: Pull daily PX_LAST & VOLUME for IONQ/QBTS/RGTI/CCMP/RTY →
+# Excel with one sheet per ticker including volume
 # ────────────────────────────────────────────────────────────────────────────
 
-# 1) (Only once) install.packages(c("Rblpapi","openxlsx","xts"))
+# 1) Install (once) and load
+# install.packages(c("Rblpapi","openxlsx","xts"))
 library(Rblpapi)
 library(openxlsx)
 library(xts)
 
-# 2) Define your universe & date range
-tickers    <- c("IONQ US Equity", "QBTS US Equity", "RGTI US Equity")
-fields     <- c("PX_LAST", "VOLUME")
+# 2) Define each dataset: ticker + fields (now including VOLUME for indices)
+datasets <- list(
+    IONQ = list(tkr = "IONQ US Equity", fields = c("PX_LAST", "VOLUME")),
+    QBTS = list(tkr = "QBTS US Equity", fields = c("PX_LAST", "VOLUME")),
+    RGTI = list(tkr = "RGTI US Equity", fields = c("PX_LAST", "VOLUME")),
+    CCMP = list(tkr = "CCMP Index",    fields = c("PX_LAST", "VOLUME")),
+    RTY  = list(tkr = "RTY Index",     fields = c("PX_LAST", "VOLUME"))
+)
+
+# 3) Set the 1-year date window
 start_date <- Sys.Date() - 365
 end_date   <- Sys.Date()
 
-# 3) Open Bloomberg connection
+# 4) Connect to Bloomberg
 blpConnect()
 
-# 4) Create a new Excel workbook
+# 5) Prepare new Excel workbook
 wb <- createWorkbook()
 
-# 5) Loop over each ticker, pull data + tidy
-for (tkr in tickers) {
+# 6) Loop: fetch, coerce, clean, and write each sheet
+for(name in names(datasets)) {
+    spec <- datasets[[name]]
     
-    # 5a) Pull the data (suppress real-time warnings)
-    raw_xts <- suppressWarnings(
+    # 6a) Fetch PX_LAST & VOLUME
+    raw <- suppressWarnings(
         bdh(
-            securities = tkr,
-            fields     = fields,
+            securities = spec$tkr,
+            fields     = spec$fields,
             start.date = start_date,
             end.date   = end_date
         )
     )
     
-    # 5b) Coerce into a data.frame with a clean Date column
-    if (inherits(raw_xts, "xts")) {
-        # For xts objects, index(raw_xts) are Date/POSIXct
+    # 6b) Coerce to data.frame with Date column
+    if (inherits(raw, "xts")) {
         df <- data.frame(
-            Date = as.Date(index(raw_xts)),
-            coredata(raw_xts),
+            Date = as.Date(index(raw)),
+            coredata(raw),
             check.names = FALSE,
             row.names   = NULL
         )
     } else {
-        # Sometimes bdh() returns a plain data.frame:
-        df_raw <- as.data.frame(raw_xts, stringsAsFactors = FALSE)
-        # If there's already a Date column, clean it
-        if ("Date" %in% names(df_raw)) {
-            df_raw$Date <- as.Date(sub(" .*", "", as.character(df_raw$Date)))
+        df <- as.data.frame(raw, stringsAsFactors = FALSE)
+        if ("Date" %in% names(df)) {
+            df$Date <- as.Date(substr(as.character(df$Date),1,10), "%Y-%m-%d")
         } else {
-            # Otherwise, use the rownames (which are the dates)
-            rn        <- rownames(df_raw)
-            rn_clean  <- sub(" .*", "", rn)          # strip any time or "UTC"
-            df_raw$Date <- as.Date(rn_clean, "%Y-%m-%d")
+            dates <- substr(rownames(raw),1,10)
+            df$Date <- as.Date(dates, "%Y-%m-%d")
         }
-        # Reorder so Date is first
-        df <- df_raw[, c("Date", setdiff(names(df_raw), "Date"))]
+        df <- df[, c("Date", setdiff(names(df), "Date"))]
     }
     
-    # 5c) Rename PX_LAST→Last and VOLUME→Vol
-    names(df) <- sub("^PX_LAST.*", "Last", names(df))
-    names(df) <- sub("^VOLUME.*" , "Vol",  names(df))
+    # 6c) Rename columns: PX_LAST → Last, VOLUME → Vol
+    names(df) <- sub("^PX_LAST.*", "Last",  names(df))
+    names(df) <- sub("^VOLUME.*",    "Vol",   names(df))
     
-    # 5d) Add a sheet for this ticker and write its data
-    sheet_name <- sub(" US Equity$", "", tkr)  # "IONQ", "QBTS", "RGTI"
-    addWorksheet(wb, sheet_name)
-    writeData(wb, sheet_name, df)
+    # 6d) Add worksheet and write
+    addWorksheet(wb, name)
+    writeData(wb, name, df)
 }
 
-# 6) Resolve your Downloads folder (~/Downloads typically maps to the network home)
+# 7) Determine Downloads folder (network home), fallback to getwd()
 downloads_dir <- path.expand("~/Downloads")
-if (!dir.exists(downloads_dir)) {
-    warning("No '~/Downloads' folder found; writing to working directory instead.")
-    downloads_dir <- getwd()
-}
+if (!dir.exists(downloads_dir)) downloads_dir <- getwd()
 
-# 7) Save the workbook
-out_file <- file.path(downloads_dir, "quantum_price_volume_by_ticker.xlsx")
+# 8) Save workbook
+out_file <- file.path(downloads_dir, "quantum_and_index_volumes.xlsx")
 saveWorkbook(wb, out_file, overwrite = TRUE)
 
-# 8) Confirmation
+# 9) Confirmation
 message(
-    "✅ Written sheets [",
-    paste(sub(" US Equity$", "", tickers), collapse = ", "),
-    "] to:\n  ", out_file
+    "✅ Created sheets: ", paste(names(datasets), collapse = ", "),
+    "\n   Saved to: ", out_file
 )
