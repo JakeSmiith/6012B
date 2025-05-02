@@ -1,0 +1,85 @@
+#------------------------------------------------------------------------------#
+# R SCRIPT: Pull Risk-Free Rates + Export to Excel
+#------------------------------------------------------------------------------#
+
+# 1. PREAMBLE: install + load packages, set date range
+#------------------------------------------------------------------------------#
+# install.packages("Rblpapi")     # for Bloomberg
+# install.packages("tidyverse")   # for data‐wrangling
+# install.packages("writexl")     # for writing Excel files
+
+library(Rblpapi)
+library(tidyverse)
+library(writexl)
+
+# connect to your local Bloomberg Terminal
+blpConnect()
+
+# choose your window:
+startDate <- as.Date("2020-01-01")
+endDate   <- Sys.Date()
+
+#------------------------------------------------------------------------------#
+# 2. METHOD A – Bloomberg 3-Month T-Bill Yield (USGG3M Index)
+#------------------------------------------------------------------------------#
+tibill_3m <- bdh(
+  securities = "USGG3M Index",
+  fields     = "PX_LAST",
+  start.date = startDate,
+  end.date   = endDate
+) %>%
+  rename(
+    date  = date,
+    yld3m = PX_LAST
+  ) %>%
+  mutate(
+    yld3m = yld3m / 100    # convert pct → decimal
+  )
+
+#------------------------------------------------------------------------------#
+# 3. METHOD B – Kenneth French Daily RF from CSV
+#------------------------------------------------------------------------------#
+ff_url  <- "http://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_Factors_daily_CSV.zip"
+tmpfile <- tempfile(fileext = ".zip")
+download.file(ff_url, tmpfile, mode = "wb")
+
+ff_raw <- read.csv(
+  unz(tmpfile, "F-F_Research_Data_Factors_daily.CSV"),
+  skip = 3,
+  stringsAsFactors = FALSE
+)
+unlink(tmpfile)
+
+ff <- ff_raw %>%
+  set_names(c("Date", "Mkt.RF", "SMB", "HML", "RF")) %>%
+  filter(!grepl("^\\s*$", Date)) %>%
+  mutate(
+    Date = as.Date(as.character(Date), format = "%Y%m%d"),
+    across(c(Mkt.RF, SMB, HML, RF), ~ as.numeric(.) / 100)
+  )
+
+#------------------------------------------------------------------------------#
+# 4. OPTIONAL: Merge the Two RF Series Side-by-Side
+#------------------------------------------------------------------------------#
+rf_compare <- tibble(date = tibill_3m$date) %>%
+  left_join(tibill_3m, by = "date") %>%
+  left_join(
+    ff %>% select(Date, RF) %>% rename(date = Date, rf_ff = RF),
+    by = "date"
+  )
+
+#------------------------------------------------------------------------------#
+# 5. EXPORT TO EXCEL
+#------------------------------------------------------------------------------#
+# pack each data.frame into its own sheet
+output_path <- file.path(getwd(), "risk_free_rates.xlsx")
+write_xlsx(
+  x = list(
+    Bloomberg_3M     = tibill_3m,
+    FamaFrench_RF    = ff,
+    RF_Comparison    = rf_compare
+  ),
+  path = output_path
+)
+
+cat("✅ Excel workbook written to:\n", output_path, "\n")
