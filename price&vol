@@ -1,0 +1,86 @@
+# ────────────────────────────────────────────────────────────────────────────
+# R Script: 1-yr Daily PX_LAST & VOLUME for IONQ, QBTS, RGTI → Excel in Downloads
+# ────────────────────────────────────────────────────────────────────────────
+
+# 1) (Only once) install.packages(c("Rblpapi","openxlsx","xts"))
+library(Rblpapi)
+library(openxlsx)
+library(xts)
+
+# 2) Define your universe & date range
+tickers    <- c("IONQ US Equity", "QBTS US Equity", "RGTI US Equity")
+fields     <- c("PX_LAST", "VOLUME")
+start_date <- Sys.Date() - 365
+end_date   <- Sys.Date()
+
+# 3) Open Bloomberg connection
+blpConnect()
+
+# 4) Create a new Excel workbook
+wb <- createWorkbook()
+
+# 5) Loop over each ticker, pull data + tidy
+for (tkr in tickers) {
+    
+    # 5a) Pull the data (suppress real-time warnings)
+    raw_xts <- suppressWarnings(
+        bdh(
+            securities = tkr,
+            fields     = fields,
+            start.date = start_date,
+            end.date   = end_date
+        )
+    )
+    
+    # 5b) Coerce into a data.frame with a clean Date column
+    if (inherits(raw_xts, "xts")) {
+        # For xts objects, index(raw_xts) are Date/POSIXct
+        df <- data.frame(
+            Date = as.Date(index(raw_xts)),
+            coredata(raw_xts),
+            check.names = FALSE,
+            row.names   = NULL
+        )
+    } else {
+        # Sometimes bdh() returns a plain data.frame:
+        df_raw <- as.data.frame(raw_xts, stringsAsFactors = FALSE)
+        # If there's already a Date column, clean it
+        if ("Date" %in% names(df_raw)) {
+            df_raw$Date <- as.Date(sub(" .*", "", as.character(df_raw$Date)))
+        } else {
+            # Otherwise, use the rownames (which are the dates)
+            rn        <- rownames(df_raw)
+            rn_clean  <- sub(" .*", "", rn)          # strip any time or "UTC"
+            df_raw$Date <- as.Date(rn_clean, "%Y-%m-%d")
+        }
+        # Reorder so Date is first
+        df <- df_raw[, c("Date", setdiff(names(df_raw), "Date"))]
+    }
+    
+    # 5c) Rename PX_LAST→Last and VOLUME→Vol
+    names(df) <- sub("^PX_LAST.*", "Last", names(df))
+    names(df) <- sub("^VOLUME.*" , "Vol",  names(df))
+    
+    # 5d) Add a sheet for this ticker and write its data
+    sheet_name <- sub(" US Equity$", "", tkr)  # "IONQ", "QBTS", "RGTI"
+    addWorksheet(wb, sheet_name)
+    writeData(wb, sheet_name, df)
+}
+
+# 6) Resolve your Downloads folder (~/Downloads typically maps to the network home)
+downloads_dir <- path.expand("~/Downloads")
+if (!dir.exists(downloads_dir)) {
+    warning("No '~/Downloads' folder found; writing to working directory instead.")
+    downloads_dir <- getwd()
+}
+
+# 7) Save the workbook
+out_file <- file.path(downloads_dir, "quantum_price_volume_by_ticker.xlsx")
+saveWorkbook(wb, out_file, overwrite = TRUE)
+
+# 8) Confirmation
+message(
+    "✅ Written sheets [",
+    paste(sub(" US Equity$", "", tickers), collapse = ", "),
+    "] to:\n  ", out_file
+)
