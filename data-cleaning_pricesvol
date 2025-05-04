@@ -93,3 +93,6 @@ results <- map(sheets, process_sheet) %>% set_names(sheets)
 
 #checks
 print(head(results[[1]]))
+print(head(results[[5]]))
+print(tail(results[[1]]))
+
