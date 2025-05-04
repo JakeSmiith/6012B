@@ -1,0 +1,134 @@
+# install.packages(c(
+#   "readxl","dplyr","lubridate","purrr","zoo","timeDate",
+#   "tidyr","broom","boot"
+# ))  # run if needed
+
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(zoo)
+library(timeDate)
+library(tidyr)
+library(broom)
+library(boot)
+
+#read & clean each sheet 
+
+file_path <- "C:/Users/jakes/Downloads/quantum_and_index_volumes.xlsx"
+sheets    <- excel_sheets(file_path)
+
+read_and_clean <- function(sheet) {
+  df <- read_excel(file_path, sheet = sheet) %>%
+    select(where(~ !all(is.na(.))))  # drop fully empty columns
+
+  # normalise names
+  names(df) <- names(df) %>%
+    tolower() %>%
+    gsub("[^a-z0-9]+","_",.)
+
+  # locate date column
+  date_col <- grep("^date$", names(df), ignore.case=TRUE, value=TRUE)[1]
+  if (is.na(date_col)) stop("No date column in sheet ", sheet)
+
+  # find numeric columns excluding date
+  num_cols     <- names(df)[sapply(df, is.numeric)]
+  numeric_only <- setdiff(num_cols, date_col)
+  if (length(numeric_only) < 2) stop("Not enough numeric columns in sheet ", sheet)
+
+  # choose volume: name contains "vol"
+  vol_candidates <- grep("vol", numeric_only, ignore.case=TRUE, value=TRUE)
+  volume_col     <- if (length(vol_candidates)) vol_candidates[1] else numeric_only[1]
+
+  # choose price: prefer name with price/last/close, else next numeric
+  price_candidates <- grep("price|last|close", numeric_only, ignore.case=TRUE, value=TRUE)
+  price_col        <- if (length(price_candidates)) price_candidates[1]
+                      else setdiff(numeric_only, volume_col)[1]
+
+  if (any(is.na(c(volume_col, price_col)))) {
+    stop("Could not identify volume or price in sheet ", sheet,
+         ". Numeric cols: ", paste(numeric_only, collapse=", "))
+  }
+
+  df %>%
+    rename(
+      date   = all_of(date_col),
+      volume = all_of(volume_col),
+      price  = all_of(price_col)
+    ) %>%
+    mutate(
+      date   = as_date(date),
+      symbol = sheet
+    ) %>%
+    arrange(date) %>%
+    distinct(date, .keep_all=TRUE)
+}
+
+df_all <- map_dfr(sheets, read_and_clean)
+
+
+# 2. compute daily metrics 
+
+df_all <- df_all %>%
+  group_by(symbol) %>%
+  arrange(date) %>%
+  mutate(
+    ret        = log(price / lag(price)),                       # log-return
+    volume_pct = volume / lag(volume) - 1,                      # percent volume change
+    real_vol   = rollapply(ret, 20, sd, align="right", fill=NA),# 20-day realized vol
+    vol_change = real_vol - lag(real_vol)                       # daily volatility change
+  ) %>%
+  ungroup()
+
+
+# split pre-/post-event windows 
+
+event_date  <- as_date("2025-01-08")
+pre_window  <- df_all %>% filter(date <  event_date)
+post_window <- df_all %>% filter(date >= event_date)
+
+stocks  <- c("IONQ","QBTS","RGTI")
+indexes <- c("CCMP","RTY")
+metrics <- c("ret","volume_pct","vol_change")
+
+
+# build table of paired pre/post differences
+
+# helper for bootstrap of mean difference
+boot_diff_mean <- function(dat, i) {
+  x <- dat[i,1]; y <- dat[i,2]
+  mean(y, na.rm=TRUE) - mean(x, na.rm=TRUE)
+}
+
+results <- expand_grid(stock = stocks, index = indexes, metric = metrics) %>%
+  mutate(
+    pre_series = map(metric, function(m) {
+      xs <- pre_window  %>% filter(symbol==stock)  %>% select(date, s=all_of(m))
+      xi <- pre_window  %>% filter(symbol==index)  %>% select(date, i=all_of(m))
+      inner_join(xs, xi, by="date") %>% select(s, i)
+    }),
+    post_series = map(metric, function(m) {
+      xs <- post_window %>% filter(symbol==stock)  %>% select(date, s=all_of(m))
+      xi <- post_window %>% filter(symbol==index)  %>% select(date, i=all_of(m))
+      inner_join(xs, xi, by="date") %>% select(s, i)
+    })
+  ) %>%
+  mutate(
+    # two-sample tests on the paired differences
+    ttest     = map2(pre_series, post_series, ~ t.test(.x$s, .y$i, paired=FALSE)),
+    wilcox    = map2(pre_series, post_series, ~ wilcox.test(.x$s, .y$i, paired=FALSE, exact=FALSE)),
+    boot_obj  = map2(pre_series, post_series, 
+                     ~ boot(cbind(.x$s, .y$i), statistic=boot_diff_mean, R=2000))
+  ) %>%
+  mutate(
+    t_stat    = map_dbl(ttest,  "statistic"),
+    t_p       = map_dbl(ttest,  "p.value"),
+    w_p       = map_dbl(wilcox, "p.value"),
+    ci_lower  = map_dbl(boot_obj, ~ tryCatch(boot.ci(.x, type="perc")$percent[4], error=function(e) NA_real_)),
+    ci_upper  = map_dbl(boot_obj, ~ tryCatch(boot.ci(.x, type="perc")$percent[5], error=function(e) NA_real_))
+  ) %>%
+  select(stock, index, metric, t_stat, t_p, w_p, ci_lower, ci_upper)
+
+
+# display final results 
+
+print(results)
