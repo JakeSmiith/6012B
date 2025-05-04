@@ -1,0 +1,150 @@
+# app.R
+library(shiny)
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(zoo)
+library(purrr)
+library(timeDate)
+library(plotly)
+
+#read and prep data
+file_path <- "C:/Users/jakes/Downloads/quantum_and_index_volumes.xlsx"
+sheets    <- excel_sheets(file_path)
+
+process_sheet <- function(sheet_name) {
+  df <- read_excel(file_path, sheet = sheet_name) %>%
+    select(where(~ !all(is.na(.)))) %>%                   # drop empty cols
+    set_names(tolower) %>%                                 # lowercase names
+    rename_with(~gsub("[^[:alnum:]]+", "_", .x)) %>%      # normalize
+    rename(
+      date   = matches("^date$"),
+      volume = matches("vol"),
+      price  = matches("price|last|close")
+    ) %>%
+    mutate(date = as_date(date)) %>%
+    arrange(date) %>%
+    distinct(date, .keep_all = TRUE) %>%
+    # rolling volume z-score
+    mutate(
+      roll_vol_mean = rollapply(volume, 60, mean,  align = "right", fill = NA),
+      roll_vol_sd   = rollapply(volume, 60, sd,    align = "right", fill = NA),
+      volume_spike  = (volume - roll_vol_mean) / roll_vol_mean
+    ) %>%
+    # realized vol
+    { if("price" %in% names(.)) mutate(., 
+        ret             = log(price/lag(price)),
+        roll_volatility = rollapply(ret, 20, sd, align="right", fill=NA)
+      ) else . }
+  
+  #checking for missing trading days
+  yrs           <- unique(year(df$date))
+  hols          <- as_date(holidayNYSE(year = yrs))
+  all_days      <- seq(min(df$date), max(df$date), by="day")
+  trading_days  <- setdiff(all_days[!wday(all_days)%in%c(1,7)], hols)
+  missing       <- setdiff(trading_days, df$date)
+  if(length(missing)>0) {
+    message(
+      sprintf("Sheet '%s' missing %d trading day(s). Examples: %s",
+              sheet_name,
+              length(missing),
+              paste(head(missing,5), collapse=", "))
+    )
+  }
+  df
+}
+
+# pull everything in, bind into one tibble
+processed_list <- map(sheets, process_sheet) %>% set_names(sheets)
+data_all       <- bind_rows(processed_list, .id="symbol") %>%
+  mutate(
+    log_price  = log(price),
+    log_volume = log(volume)
+  )
+
+# convenience vectors
+stocks  <- c("IONQ","QBTS","RGTI")
+indexes <- c("CCMP","RTY")
+all_syms <- names(processed_list)
+
+
+#ui 
+ui <- fluidPage(
+  titlePanel("Quantum Stocks Dashboard"),
+  sidebarLayout(
+    sidebarPanel(
+      checkboxGroupInput("symbols", "Symbols to plot:",
+                         choices = all_syms, selected = stocks),
+      radioButtons("priceScale",  "Price scale:",  c("Raw","Log")),
+      radioButtons("volumeScale", "Volume scale:", c("Raw","Log")),
+      checkboxInput("showPrice",  "Show Price Plot",      TRUE),
+      checkboxInput("showVolume", "Show Volume Plot",     TRUE),
+      checkboxInput("showVol",    "Show Volatility Plot", TRUE)
+    ),
+    mainPanel(
+      conditionalPanel("input.showPrice",  plotlyOutput("pricePlot")),
+      conditionalPanel("input.showVolume", plotlyOutput("volumePlot")),
+      conditionalPanel("input.showVol",    plotlyOutput("volPlot"))
+    )
+  )
+)
+
+
+#server 
+server <- function(input, output, session) {
+  filtered_data <- reactive({
+    req(input$symbols)
+    data_all %>% filter(symbol %in% input$symbols)
+  })
+  
+  output$pricePlot <- renderPlotly({
+    df <- filtered_data()
+    yvar <- if (input$priceScale=="Raw") "price" else "log_price"
+    
+    p <- plot_ly()
+    for (sym in input$symbols) {
+      dsub <- df %>% filter(symbol==sym)
+      axis <- if (sym %in% stocks) "y" else "y2"
+      p <- add_lines(p, x = dsub$date, y = dsub[[yvar]], name = sym, yaxis = axis)
+    }
+    layout(p,
+      title = "Price Over Time",
+      yaxis  = list(title = if(input$priceScale=="Raw") "Price" else "Log Price"),
+      yaxis2 = list(overlaying = "y", side = "right", title = "Index Price")
+    )
+  })
+  
+  output$volumePlot <- renderPlotly({
+    df <- filtered_data()
+    yvar <- if (input$volumeScale=="Raw") "volume" else "log_volume"
+    
+    p <- plot_ly()
+    for (sym in input$symbols) {
+      dsub <- df %>% filter(symbol==sym)
+      axis <- if (sym %in% stocks) "y" else "y2"
+      p <- add_lines(p, x = dsub$date, y = dsub[[yvar]], name = sym, yaxis = axis)
+    }
+    layout(p,
+      title = "Volume Over Time",
+      yaxis  = list(title = if(input$volumeScale=="Raw") "Volume" else "Log Volume"),
+      yaxis2 = list(overlaying = "y", side = "right", title = "Index Volume")
+    )
+  })
+  
+  output$volPlot <- renderPlotly({
+    df <- filtered_data()
+    p <- plot_ly()
+    for (sym in input$symbols) {
+      dsub <- df %>% filter(symbol==sym)
+      axis <- if (sym %in% stocks) "y" else "y2"
+      p <- add_lines(p, x = dsub$date, y = dsub$roll_volatility, name = sym, yaxis = axis)
+    }
+    layout(p,
+      title = "Realized Volatility (20-day) Over Time",
+      yaxis  = list(title = "Volatility"),
+      yaxis2 = list(overlaying = "y", side = "right", title = "Index Volatility")
+    )
+  })
+}
+
+shinyApp(ui, server)
