@@ -17,6 +17,22 @@ indexes     <- c('CCMP', 'RTY')
 boot_mean <- function(x, i) mean(x[i], na.rm = TRUE)
 
 # ────────────────────────────────────────────────────────────────────────────────
+# Helper for bootstrap CI
+# ────────────────────────────────────────────────────────────────────────────────
+get_boot_ci <- function(ARs, R = 2000) {
+    if (length(ARs) < 2) return(c(NA_real_, NA_real_))
+    b  <- boot(ARs, boot_mean, R = R)
+    ci <- boot.ci(b, type = c('bca','perc'))
+    if (!is.null(ci$bca)) {
+        ci$bca[4:5]
+    } else if (!is.null(ci$percent)) {
+        ci$percent[4:5]
+    } else {
+        c(NA_real_, NA_real_)
+    }
+}
+
+# ────────────────────────────────────────────────────────────────────────────────
 # 2) LOAD & CLEAN each sheet
 # ────────────────────────────────────────────────────────────────────────────────
 read_and_clean <- function(sheet) {
@@ -27,7 +43,7 @@ read_and_clean <- function(sheet) {
     date_col     <- grep('^date$', names(df), ignore.case = TRUE, value = TRUE)[1]
     numeric_cols <- setdiff(names(df)[sapply(df, is.numeric)], date_col)
     if (is.na(date_col) || length(numeric_cols) < 2) {
-        stop(glue::glue("Sheet '{sheet}' needs 'date' + ≥2 numerics; found date='{date_col}' and nums={paste(numeric_cols, collapse=',')}"))
+        stop(glue::glue("Sheet '{sheet}' needs 'date' + ≥2 numerics"))
     }
     
     df %>%
@@ -49,7 +65,7 @@ safe   <- purrr::map(sheets, purrr::safely(read_and_clean))
 errs   <- purrr::keep(safe, ~ !is.null(.x$error))
 if (length(errs)) {
     msgs <- purrr::imap_chr(errs, ~ glue::glue("{sheets[.y]}: {.x$error$message}"))
-    stop('Load errors:\n', paste(msgs, collapse = '\n'))
+    stop('Load errors:\n', paste(msgs, collapse='\n'))
 }
 df_all <- purrr::map_dfr(safe, 'result')
 
@@ -74,7 +90,7 @@ index_ret <- df_all %>%
 # 4) ESTIMATE market-model α, β & σ per (stock, index)
 # ────────────────────────────────────────────────────────────────────────────────
 est_end   <- event_date - days(2)
-est_start <- est_end   - days(250)
+est_start <- est_end - days(250)
 
 params <- expand_grid(stock = stocks, index = indexes) %>%
     mutate(
@@ -96,8 +112,8 @@ params <- expand_grid(stock = stocks, index = indexes) %>%
 # ────────────────────────────────────────────────────────────────────────────────
 ar_df <- params %>%
     pmap_dfr(function(stock, index, alpha, beta, sigma) {
-        df_s <- stock_ret %>% filter(stock == stock)
-        df_i <- index_ret %>% filter(index == index)
+        df_s <- stock_ret   %>% filter(stock == stock)
+        df_i <- index_ret   %>% filter(index == index)
         inner_join(df_s, df_i, by = 'date') %>%
             transmute(
                 stock,
@@ -108,64 +124,44 @@ ar_df <- params %>%
     })
 
 # ────────────────────────────────────────────────────────────────────────────────
-# 6) COMPUTE CARs & TEST STATISTICS (Patell’s Z & Corrado’s rank)
+# 6) COMPUTE CARs & TEST STATISTICS
 # ────────────────────────────────────────────────────────────────────────────────
 results <- params %>%
     crossing(window = window_days) %>%
     rowwise() %>%
     mutate(
-        sc = stock,
-        ix = index,
-        
-        df_win = list(
+        df_win    = list(
             ar_df %>%
-                filter(stock == sc, index == ix, date >= event_date) %>%
-                arrange(date) %>%
+                filter(stock == stock, index == index, date >= event_date) %>%
                 slice_head(n = window)
         ),
-        
         n_obs     = nrow(df_win),
         ARs       = list(df_win$AR),
-        CAR       = sum(ARs, na.rm = TRUE),
-        boot      = if (n_obs >= 2) list(boot(ARs[[1]], boot_mean, R = 2000)) else list(NULL),
-        patell_z  = if (n_obs >= 1) CAR / (sigma * sqrt(n_obs)) else NA_real_,
-        patell_p  = if (n_obs >= 1) 2 * (1 - pnorm(abs(patell_z))) else NA_real_,
-        
-        corrado_z = if (n_obs >= 1) {
-            df_est <- ar_df %>%
-                filter(stock == sc, index == ix, date >= est_start, date <= est_end)
-            
-            m <- n_obs
-            n <- nrow(df_est)
-            combined <- c(df_est$AR, df_win$AR)
-            ranks    <- rank(combined, ties.method = 'average')
-            r_event  <- ranks[(n + 1):(n + m)]
-            
-            (sum(r_event) - m * (length(combined) + 1) / 2) /
-                sqrt(m * n * (length(combined) + 1) / 12)
+        CAR       = sum(ARs[[1]], na.rm = TRUE),
+        patell_z  = if (n_obs>=1) CAR / (sigma*sqrt(n_obs)) else NA_real_,
+        patell_p  = if (n_obs>=1) 2*(1 - pnorm(abs(patell_z))) else NA_real_,
+        corrado_z = if(n_obs>=1){
+            df_est <- ar_df %>% filter(stock==stock,index==index,
+                                       date>=est_start, date<=est_end)
+            m <- n_obs; n<-nrow(df_est)
+            all_AR <- c(df_est$AR, df_win$AR)
+            r <- rank(all_AR,ties.method='average')
+            re <- r[(n+1):(n+m)]
+            (sum(re)-m*(length(all_AR)+1)/2)/
+                sqrt(m*n*(length(all_AR)+1)/12)
         } else NA_real_,
-        corrado_p = if (!is.na(corrado_z)) 2 * (1 - pnorm(abs(corrado_z))) else NA_real_,
-        
-        # updated CI logic: try multiple types and fallback
-        ci_vals = list(
-            tryCatch({
-                ci_all <- boot.ci(boot[[1]], type = c('perc','bca','basic'))
-                if (!is.null(ci_all$percent)) return(ci_all$percent[c(4,5)])
-                if (!is.null(ci_all$bca))    return(ci_all$bca[c(4,5)])
-                if (!is.null(ci_all$basic))  return(ci_all$basic[c(4,5)])
-                c(NA_real_, NA_real_)
-            }, error = function(e) c(NA_real_, NA_real_))
-        ),
-        ci_lo = ci_vals[[1]][1],
-        ci_hi = ci_vals[[1]][2],
-        sample_AR = list(round(ARs[[1]][1:min(5, n_obs)], 4))
+        corrado_p = if(!is.na(corrado_z)) 2*(1-pnorm(abs(corrado_z))) else NA_real_,
+        ci       = list(get_boot_ci(ARs[[1]])),
+        ci_lo    = ci[[1]][1],
+        ci_hi    = ci[[1]][2],
+        sample_AR= list(round(ARs[[1]][1:min(5,n_obs)],4))
     ) %>%
     ungroup() %>%
     select(
-        stock, index, window, n_obs, CAR,
-        patell_z, patell_p,
-        corrado_z, corrado_p,
-        ci_lo, ci_hi,
+        stock,index,window,n_obs,CAR,
+        patell_z,patell_p,
+        corrado_z,corrado_p,
+        ci_lo,ci_hi,
         sample_AR
     )
 
@@ -176,15 +172,12 @@ ui <- fluidPage(
     titlePanel('Market‐Model Event‐Study: Patell’s Z & Corrado’s Rank'),
     sidebarLayout(
         sidebarPanel(
-            selectInput('stock', 'Stock:', choices = unique(results$stock), multiple = TRUE, selected = unique(results$stock)),
-            selectInput('index', 'Index:', choices = unique(results$index), multiple = TRUE, selected = unique(results$index)),
-            checkboxGroupInput('window', 'Window (days):', choices = window_days, selected = window_days)
+            selectInput('stock','Stock:',unique(results$stock),multiple=TRUE,selected=unique(results$stock)),
+            selectInput('index','Index:',unique(results$index),multiple=TRUE,selected=unique(results$index)),
+            checkboxGroupInput('window','Window (days):',window_days,selected=window_days)
         ),
         mainPanel(
-            DTOutput('table'),
-            hr(),
-            h4('Diagnostics:'),
-            verbatimTextOutput('diag')
+            DTOutput('table'), hr(), h4('Diagnostics:'), verbatimTextOutput('diag')
         )
     )
 )
@@ -192,34 +185,44 @@ ui <- fluidPage(
 server <- function(input, output, session) {
     filtered <- reactive({
         df <- results %>%
-            filter(stock  %in% input$stock,
-                   index  %in% input$index,
-                   window %in% input$window)
-        validate(need(nrow(df) > 0, 'No rows match your filters—expand your selection.'))
+            filter(
+                stock  %in% input$stock,
+                index  %in% input$index,
+                window %in% input$window
+            )
+        validate(need(nrow(df)>0,'No rows match your filters'))
         df
     })
     
     output$table <- renderDT({
+        df <- filtered() %>%
+            mutate(
+                ci_lo     = round(ci_lo,4),
+                ci_hi     = round(ci_hi,4),
+                sample_AR = sapply(sample_AR,function(x) paste(x,collapse=', '))
+            )
         datatable(
-            filtered() %>% mutate(sample_AR = sapply(sample_AR, paste, collapse = ', ')),
-            rownames = FALSE,
-            options = list(pageLength = 10, autoWidth = TRUE),
-            caption = htmltools::tags$caption(
-                style = 'caption-side:bottom; text-align:left;',
+            df,
+            rownames=FALSE,
+            options=list(pageLength=10,autoWidth=TRUE),
+            caption=htmltools::tags$caption(
+                style='caption-side:bottom; text-align:left;',
                 paste(
-                    'n_obs = # of AR days;','CAR = cumulative abnormal return;',
-                    'patell_z/p = Patell’s Z stat/p;','corrado_z/p = Corrado’s rank stat/p;',
-                    'ci_lo/ci_hi = bootstrap 95% CI;','sample_AR = first 5 AR values'
+                    'n_obs = # of AR days;',
+                    'CAR = cumulative abnormal return;',
+                    'patell_z/p = Patell’s Z stat/p;',
+                    'corrado_z/p = Corrado’s rank stat/p;',
+                    'ci_lo/ci_hi = bootstrap 95% CI;',
+                    'sample_AR = first 5 AR values'
                 )
             )
         )
     })
     
-    output
-    diag <- renderPrint({
-        cat('PARAMS (stock,index,α,β,σ):\n')
-        print(params)
-        cat('\nRESULTS rows:', nrow(results), ' (should be ', nrow(params)*length(window_days), ')\n', sep = '')
+    output$diag <- renderPrint({
+        cat('PARAMS combos:',nrow(params),'\n',
+            'RESULTS rows:',nrow(results),'(should be',
+            nrow(params)*length(window_days),')\n')
     })
 }
 
