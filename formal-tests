@@ -1,58 +1,47 @@
 # app.R
+
 library(shiny)
 library(readxl)
 library(dplyr)
 library(lubridate)
-library(zoo)
-library(timeDate)
-library(tidyr)
-library(purrr)
-library(broom)
 library(boot)
 library(DT)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# GLOBAL: load & compute results
+# 1) PARAMETERS & HELPERS
 # ────────────────────────────────────────────────────────────────────────────────
 
-file_path  <- "C:/Users/jakes/Downloads/quantum_and_index_volumes.xlsx"
-sheets     <- excel_sheets(file_path)
-event_date <- as_date("2025-01-08")
-window_days<- c(5,20,60)
-stocks     <- c("IONQ","QBTS","RGTI")
-indexes    <- c("CCMP","RTY")
-metrics    <- c("ret","volume_pct","vol_change")
+file_path   <- "C:/Users/jakes/Downloads/quantum_and_index_volumes.xlsx"
+event_date  <- as_date("2025-01-08")
+window_days <- c(5, 20, 60)
+stocks      <- c("IONQ","QBTS","RGTI")
+indexes     <- c("CCMP","RTY")
 
-# robust loader
+boot_mean <- function(x, i) mean(x[i], na.rm=TRUE)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# 2) LOAD & CLEAN each sheet
+# ────────────────────────────────────────────────────────────────────────────────
+
 read_and_clean <- function(sheet) {
   df <- read_excel(file_path, sheet = sheet) %>%
-    select(where(~!all(is.na(.))))  # drop empty cols
+    select(where(~ !all(is.na(.)))) %>%
+    set_names(~ tolower(gsub("[^a-z0-9]+","_", .x)))
 
-  # normalize names
-  names(df) <- names(df) %>% tolower() %>% gsub("[^a-z0-9]+","_",.)
-
-  # find date column
-  date_col <- grep("^date$", names(df), ignore.case=TRUE, value=TRUE)[1]
-  if (is.na(date_col)) stop("No date col in ", sheet)
-
-  # find numeric cols except date
-  num_cols    <- names(df)[sapply(df, is.numeric)]
-  numeric_only<- setdiff(num_cols, date_col)
-  if (length(numeric_only) < 2) stop("Not enough numeric cols in ", sheet)
-
-  # pick volume
-  vol_cand   <- grep("vol", numeric_only, ignore.case=TRUE, value=TRUE)
-  volume_col <- if (length(vol_cand)) vol_cand[1] else numeric_only[1]
-
-  # pick price
-  price_cand <- grep("price|last|close", numeric_only, ignore.case=TRUE, value=TRUE)
-  price_col  <- if (length(price_cand)) price_cand[1] else setdiff(numeric_only,volume_col)[1]
+  date_col     <- grep("^date$",   names(df), ignore.case=TRUE, value=TRUE)[1]
+  numeric_cols <- setdiff(names(df)[sapply(df,is.numeric)], date_col)
+  if (is.na(date_col) || length(numeric_cols) < 2) {
+    stop("Sheet '", sheet, "' needs exact 'date' + ≥2 numerics; found date='",
+         date_col,"' and nums=", paste(numeric_cols, collapse=","))
+  }
+  price_col  <- numeric_cols[1]
+  volume_col <- numeric_cols[2]
 
   df %>%
     rename(
       date   = all_of(date_col),
-      volume = all_of(volume_col),
-      price  = all_of(price_col)
+      price  = all_of(price_col),
+      volume = all_of(volume_col)
     ) %>%
     mutate(
       date   = as_date(date),
@@ -62,115 +51,183 @@ read_and_clean <- function(sheet) {
     distinct(date, .keep_all=TRUE)
 }
 
-# read + bind
-df_all <- map_dfr(sheets, read_and_clean)
-
-# compute metrics
-df_all <- df_all %>%
-  group_by(symbol) %>% arrange(date) %>%
-  mutate(
-    ret        = log(price/lag(price)),
-    volume_pct = volume/lag(volume) - 1,
-    real_vol   = rollapply(ret, 20, sd, align="right", fill=NA),
-    vol_change = real_vol - lag(real_vol)
-  ) %>%
-  ungroup()
-
-# bootstrap helper
-boot_diff_mean <- function(dat,i) mean(dat[i,2] - dat[i,1], na.rm=TRUE)
-
-# build result table
-results <- expand_grid(
-  stock  = stocks,
-  index  = indexes,
-  metric = metrics,
-  window = window_days
-) %>%
-  mutate(
-    pairs = pmap(
-      list(stock,index,metric,window),
-      function(stock,index,metric,window) {
-        pre_s  <- df_all %>% filter(symbol==stock, 
-                                     date>=event_date - days(window), 
-                                     date< event_date) %>%
-                  select(date,val_s=all_of(metric))
-        pre_i  <- df_all %>% filter(symbol==index, 
-                                     date>=event_date - days(window), 
-                                     date< event_date) %>%
-                  select(date,val_i=all_of(metric))
-        post_s <- df_all %>% filter(symbol==stock,
-                                     date>=event_date, 
-                                     date< event_date+window) %>%
-                  select(date,val_s=all_of(metric))
-        post_i <- df_all %>% filter(symbol==index,
-                                     date>=event_date, 
-                                     date< event_date+window) %>%
-                  select(date,val_i=all_of(metric))
-        pre_df  <- inner_join(pre_s, pre_i,  by="date")
-        post_df <- inner_join(post_s, post_i, by="date")
-        list(
-          pre  = pre_df$val_s  - pre_df$val_i,
-          post = post_df$val_s - post_df$val_i
-        )
-      }
-    )
-  ) %>% unnest_wider(pairs) %>%
-  mutate(
-    ttest   = map2(pre, post, ~ t.test(.x, .y, var.equal=FALSE)),
-    wilcox  = map2(pre, post, ~ wilcox.test(.x, .y, exact=FALSE)),
-    bootobj = map2(pre, post, ~ boot(cbind(.x,.y), statistic=boot_diff_mean, R=2000))
-  ) %>%
-  mutate(
-    t_stat   = map_dbl(ttest,  "statistic"),
-    t_p      = map_dbl(ttest,  "p.value"),
-    w_p      = map_dbl(wilcox, "p.value"),
-    ci_lower = map_dbl(bootobj,~ tryCatch(boot.ci(.x,type="perc")$percent[4], error=function(e) NA_real_)),
-    ci_upper = map_dbl(bootobj,~ tryCatch(boot.ci(.x,type="perc")$percent[5], error=function(e) NA_real_))
-  ) %>%
-  select(stock,index,metric,window,t_stat,t_p,w_p,ci_lower,ci_upper)
+sheets <- excel_sheets(file_path)
+safe   <- map(sheets, safely(read_and_clean))
+errs   <- keep(safe, ~ !is.null(.x$error))
+if (length(errs)) {
+  msg <- imap_chr(errs, ~ paste0(sheets[.y], ": ", .x$error$message))
+  stop("Load errors:\n", paste(msg, collapse="\n"))
+}
+df_all <- map_dfr(safe, "result")
 
 # ────────────────────────────────────────────────────────────────────────────────
-# UI
+# 3) COMPUTE daily log‐returns
+# ────────────────────────────────────────────────────────────────────────────────
+
+df_all <- df_all %>%
+  group_by(symbol) %>%
+  arrange(date) %>%
+  mutate(ret = log(price / lag(price))) %>%
+  ungroup()
+
+# split into two tables for explicit joins
+stock_ret <- df_all %>%
+  filter(symbol %in% stocks) %>%
+  select(date, stock = symbol, stock_ret = ret)
+
+index_ret <- df_all %>%
+  filter(symbol %in% indexes) %>%
+  select(date, index = symbol, idx_ret = ret)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# 4) ESTIMATE market‐model α, β per (stock,index)
+# ────────────────────────────────────────────────────────────────────────────────
+
+est_end   <- event_date - days(2)
+est_start <- est_end   - days(250)
+
+params <- expand_grid(stock = stocks, index = indexes) %>%
+  mutate(
+    data = map2(stock, index, \(s,i) {
+      inner_join(
+        filter(stock_ret, stock==s, date>=est_start, date<=est_end),
+        filter(index_ret, index==i, date>=est_start, date<=est_end),
+        by="date"
+      )
+    }),
+    alpha = map_dbl(data, ~ {
+      d <- .x; 
+      if (nrow(d) < 30) return(NA_real_)
+      coef(lm(stock_ret ~ idx_ret, data=d))[1]
+    }),
+    beta = map_dbl(data, ~ {
+      d <- .x;
+      if (nrow(d) < 30) return(NA_real_)
+      coef(lm(stock_ret ~ idx_ret, data=d))[2]
+    })
+  ) %>%
+  select(stock,index,alpha,beta) %>%
+  filter(!is.na(alpha), !is.na(beta))
+
+# ────────────────────────────────────────────────────────────────────────────────
+# 5) BUILD AR series explicitly by join
+# ────────────────────────────────────────────────────────────────────────────────
+
+ar_df <- params %>%
+  pmap_dfr(function(stock,index,alpha,beta) {
+    inner_join(
+      filter(stock_ret,  stock==stock),
+      filter(index_ret,  index==index),
+      by="date"
+    ) %>%
+    transmute(
+      stock,
+      index,
+      date,
+      AR = stock_ret - (alpha + beta * idx_ret)
+    )
+  })
+
+# ────────────────────────────────────────────────────────────────────────────────
+# 6) COMPUTE CARs & TEST STATISTICS
+#     one row per (stock,index,window)
+# ────────────────────────────────────────────────────────────────────────────────
+
+results <- params %>%
+  crossing(window = window_days) %>%
+  rowwise() %>%
+  mutate(
+    df_win = list(
+      filter(ar_df,
+             stock==stock,
+             index==index,
+             date>=event_date,
+             date< event_date+days(window))
+    ),
+    n_obs = nrow(df_win),
+    ARs   = list(df_win$AR),
+    CAR   = sum(df_win$AR, na.rm=TRUE),
+    ttest = if(n_obs>=2) list(t.test(df_win$AR, mu=0)) else list(NULL),
+    wilcox= if(n_obs>=2) list(wilcox.test(df_win$AR, mu=0, exact=FALSE)) else list(NULL),
+    boot  = if(n_obs>=2) list(boot(df_win$AR, boot_mean, R=2000)) else list(NULL)
+  ) %>%
+  mutate(
+    t_stat   = if(is.null(ttest)) NA_real_ else ttest$statistic,
+    t_p      = if(is.null(ttest)) NA_real_ else ttest$p.value,
+    w_stat   = if(is.null(wilcox)) NA_real_ else wilcox$statistic,
+    w_p      = if(is.null(wilcox)) NA_real_ else wilcox$p.value,
+    ci_lo    = if(is.null(boot)) NA_real_ else tryCatch(boot.ci(boot,type="perc")$percent[4], error=\(e)NA_real_),
+    ci_hi    = if(is.null(boot)) NA_real_ else tryCatch(boot.ci(boot,type="perc")$percent[5], error=\(e)NA_real_),
+    sample_AR = list(round(ARs[1:min(5,n_obs)],4))
+  ) %>%
+  ungroup() %>%
+  select(stock,index,window,n_obs,CAR,
+         t_stat,t_p,
+         w_stat,w_p,
+         ci_lo,ci_hi,
+         sample_AR)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# 7) SHINY: UI + SERVER
 # ────────────────────────────────────────────────────────────────────────────────
 
 ui <- fluidPage(
-  titlePanel("Event‐Study: Quantum Stocks vs. Index Pre/Post Jan 8"),
+  titlePanel("Market‐Model Event‐Study CARs After Jan 8, 2025"),
   sidebarLayout(
     sidebarPanel(
-      selectInput("stock","Stock:", choices=stocks,   multiple=TRUE, selected=stocks),
-      selectInput("index","Index:", choices=indexes, multiple=TRUE, selected=indexes),
-      selectInput("metric","Metric:",choices=metrics,multiple=TRUE,selected=metrics),
-      checkboxGroupInput("window","Window (days):",choices=window_days,selected=window_days)
+      selectInput("stock", "Stock:",  choices=unique(results$stock),
+                  multiple=TRUE, selected=unique(results$stock)),
+      selectInput("index", "Index:",  choices=unique(results$index),
+                  multiple=TRUE, selected=unique(results$index)),
+      checkboxGroupInput("window","Window (days):",
+                         choices=window_days, selected=window_days)
     ),
     mainPanel(
-      DTOutput("table")
+      DTOutput("table"),
+      hr(),
+      h4("Diagnostics:"),
+      verbatimTextOutput("diag")
     )
   )
 )
 
-# ────────────────────────────────────────────────────────────────────────────────
-# SERVER
-# ────────────────────────────────────────────────────────────────────────────────
-
 server <- function(input, output, session) {
   filtered <- reactive({
-    req(input$stock, input$index, input$metric, input$window)
-    results %>%
+    df <- results %>%
       filter(stock  %in% input$stock,
              index  %in% input$index,
-             metric %in% input$metric,
              window %in% input$window)
+    validate(need(nrow(df)>0, "No rows match your filters—expand your selection."))
+    df
   })
+
   output$table <- renderDT({
-    datatable(filtered(),
-              rownames=FALSE,
-              options=list(pageLength=10,autoWidth=TRUE),
-              caption=htmltools::tags$caption(
-                style='caption-side: bottom; text-align: left;',
-                't_p = Welch p-value, w_p = Wilcoxon p-value'
-              ))
+    datatable(
+      filtered() %>%
+        # unnest the sample_AR list for display
+        mutate(sample_AR = sapply(sample_AR, paste, collapse=", ")),
+      rownames=FALSE,
+      options=list(pageLength=10, autoWidth=TRUE),
+      caption=htmltools::tags$caption(
+        style='caption-side:bottom; text-align:left;',
+        paste(
+          "n_obs = # of AR days;",  
+          "CAR = cumulative abnormal return;",  
+          "t_stat/t_p = Welch t-test stat/p;",  
+          "w_stat/w_p = Wilcoxon stat/p;",  
+          "ci_lo/ci_hi = bootstrap 95% CI;",  
+          "sample_AR = first 5 AR values"
+        )
+      )
+    )
+  })
+
+  output$diag <- renderPrint({
+    cat("PARAMS (stock,index,α,β):\n")
+    print(params)
+    cat("\nRESULTS rows:", nrow(results), 
+        " (should be ", nrow(params)*length(window_days), ")\n", sep="")
   })
 }
 
-# ────────────────────────────────────────────────────────────────────────────────
 shinyApp(ui, server)
