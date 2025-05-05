@@ -1,0 +1,125 @@
+# app.R
+
+library(shiny)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(boot)
+library(DT)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# --- (1) YOUR PREVIOUS DATA‐LOAD + ESTIMATION CODE GOES HERE to build `results`
+#     … exactly as in your script up through the end of step (6). 
+#     It must leave you with a data.frame `results` having columns
+#       stock, index, window, patell_p, plus others.
+# ────────────────────────────────────────────────────────────────────────────────
+
+# For illustration, assume `results` is already in memory.
+# --------------------------------------------------------------------------------
+
+# ────────────────────────────────────────────────────────────────────────────────
+# (2) BUILD THE TWO SUMMARY TABLES
+# ────────────────────────────────────────────────────────────────────────────────
+
+ccmp_tbl <- results %>%
+    filter(index == 'CCMP') %>%
+    select(stock, window, patell_p) %>%
+    pivot_wider(
+        names_from  = window,
+        names_prefix= "Window_",
+        values_from = patell_p
+    ) %>%
+    arrange(stock) %>%
+    mutate(across(-stock, ~ round(.x, 4)))
+
+rty_tbl <- results %>%
+    filter(index == 'RTY') %>%
+    select(stock, window, patell_p) %>%
+    pivot_wider(
+        names_from  = window,
+        names_prefix= "Window_",
+        values_from = patell_p
+    ) %>%
+    arrange(stock) %>%
+    mutate(across(-stock, ~ round(.x, 4)))
+
+# ────────────────────────────────────────────────────────────────────────────────
+# (3) SHINY UI + SERVER
+# ────────────────────────────────────────────────────────────────────────────────
+
+ui <- fluidPage(
+    titlePanel("Patell’s p-Values: Constituents vs CCMP & RTY"),
+    fluidRow(
+        column(
+            width = 6,
+            h3("Comparison vs CCMP"),
+            DTOutput("tbl_ccmp")
+        ),
+        column(
+            width = 6,
+            h3("Comparison vs RTY"),
+            DTOutput("tbl_rty")
+        )
+    )
+)
+
+server <- function(input, output, session) {
+    
+    # Table for CCMP
+    output$tbl_ccmp <- renderDT({
+        datatable(
+            ccmp_tbl,
+            rownames = FALSE,
+            class    = 'stripe hover',
+            options  = list(
+                dom       = 't',        # no search / paging
+                autoWidth = TRUE,
+                columnDefs = list(
+                    list(className = 'dt-center', targets = "_all")
+                )
+            ),
+            caption = htmltools::tags$caption(
+                style = 'caption-side: bottom; text-align: left;',
+                "Patell’s p-values for each stock over 3 windows vs CCMP"
+            )
+        ) %>%
+            # highlight: green for p<.05, yellow for .05≤p<.10
+            formatStyle(
+                columns       = names(ccmp_tbl)[-1],
+                backgroundColor = styleInterval(
+                    c(0.05, 0.10),
+                    c('lightgreen', 'lightyellow', 'white')
+                )
+            )
+    })
+    
+    # Table for RTY
+    output$tbl_rty <- renderDT({
+        datatable(
+            rty_tbl,
+            rownames = FALSE,
+            class    = 'stripe hover',
+            options  = list(
+                dom       = 't',
+                autoWidth = TRUE,
+                columnDefs = list(
+                    list(className = 'dt-center', targets = "_all")
+                )
+            ),
+            caption = htmltools::tags$caption(
+                style = 'caption-side: bottom; text-align: left;',
+                "Patell’s p-values for each stock over 3 windows vs RTY"
+            )
+        ) %>%
+            formatStyle(
+                columns       = names(rty_tbl)[-1],
+                backgroundColor = styleInterval(
+                    c(0.05, 0.10),
+                    c('lightgreen', 'lightyellow', 'white')
+                )
+            )
+    })
+}
+
+shinyApp(ui, server)
